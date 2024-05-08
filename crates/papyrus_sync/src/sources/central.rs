@@ -26,7 +26,7 @@ use papyrus_storage::state::StateStorageReader;
 use papyrus_storage::{StorageError, StorageReader};
 use serde::{Deserialize, Serialize};
 use starknet_api::block::{Block, BlockHash, BlockNumber, BlockSignature};
-use starknet_api::core::{ClassHash, CompiledClassHash};
+use starknet_api::core::{ClassHash, CompiledClassHash, SequencerPublicKey};
 use starknet_api::crypto::Signature;
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::state::StateDiff;
@@ -188,6 +188,8 @@ pub trait CentralSourceTrait {
         &self,
         class_hash: ClassHash,
     ) -> Result<CasmContractClass, CentralError>;
+
+    async fn get_sequencer_pub_key(&self) -> Result<SequencerPublicKey, CentralError>;
 }
 
 pub(crate) type BlocksStream<'a> =
@@ -381,6 +383,10 @@ impl<TStarknetClient: StarknetReader + Send + Sync + 'static> CentralSourceTrait
             Err(err) => Err(CentralError::ClientError(Arc::new(err))),
         }
     }
+
+    async fn get_sequencer_pub_key(&self) -> Result<SequencerPublicKey, CentralError> {
+        Ok(self.starknet_client.sequencer_pub_key().await.map_err(Arc::new)?)
+    }
 }
 
 fn client_to_central_block(
@@ -398,7 +404,9 @@ fn client_to_central_block(
             debug!("Received new block {current_block_number} with hash {}.", block.block_hash());
             trace!("Block: {block:#?}, signature data: {signature_data:#?}.");
             let block = block
-                .to_starknet_api_block_and_version()
+                .to_starknet_api_block_and_version(
+                    signature_data.signature_input.state_diff_commitment,
+                )
                 .map_err(|err| CentralError::ClientError(Arc::new(err)))?;
             Ok((
                 block,

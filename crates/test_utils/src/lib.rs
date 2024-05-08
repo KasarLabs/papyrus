@@ -8,6 +8,7 @@ use std::env;
 use std::fs::read_to_string;
 use std::hash::Hash;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::ops::{Deref, Index};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,6 +60,7 @@ use starknet_api::core::{
     GlobalRoot,
     Nonce,
     SequencerContractAddress,
+    StateDiffCommitment,
     TransactionCommitment,
 };
 use starknet_api::crypto::Signature;
@@ -77,7 +79,7 @@ use starknet_api::deprecated_contract_class::{
     StructMember,
     TypedParameter,
 };
-use starknet_api::hash::{StarkFelt, StarkHash};
+use starknet_api::hash::{PoseidonHash, StarkFelt, StarkHash};
 use starknet_api::stark_felt;
 use starknet_api::state::{
     ContractClass,
@@ -126,6 +128,7 @@ use starknet_api::transaction::{
     Resource,
     ResourceBounds,
     ResourceBoundsMapping,
+    RevertedTransactionExecutionStatus,
     Tip,
     Transaction,
     TransactionExecutionStatus,
@@ -310,27 +313,33 @@ fn get_rand_test_body_with_events(
 fn get_test_transaction_output(transaction: &Transaction) -> TransactionOutput {
     let mut rng = get_rng();
     let execution_resources = ExecutionResources::get_test_instance(&mut rng);
+    let execution_status = TransactionExecutionStatus::get_test_instance(&mut rng);
     match transaction {
         Transaction::Declare(_) => TransactionOutput::Declare(DeclareTransactionOutput {
             execution_resources,
+            execution_status,
             ..Default::default()
         }),
         Transaction::Deploy(_) => TransactionOutput::Deploy(DeployTransactionOutput {
             execution_resources,
+            execution_status,
             ..Default::default()
         }),
         Transaction::DeployAccount(_) => {
             TransactionOutput::DeployAccount(DeployAccountTransactionOutput {
                 execution_resources,
+                execution_status,
                 ..Default::default()
             })
         }
         Transaction::Invoke(_) => TransactionOutput::Invoke(InvokeTransactionOutput {
             execution_resources,
+            execution_status,
             ..Default::default()
         }),
         Transaction::L1Handler(_) => TransactionOutput::L1Handler(L1HandlerTransactionOutput {
             execution_resources,
+            execution_status,
             ..Default::default()
         }),
     }
@@ -416,10 +425,11 @@ auto_impl_get_test_instance! {
         pub sequencer: SequencerContractAddress,
         pub timestamp: BlockTimestamp,
         pub l1_da_mode: L1DataAvailabilityMode,
-        pub transaction_commitment: TransactionCommitment,
-        pub event_commitment: EventCommitment,
-        pub n_transactions: u64,
-        pub n_events: u64,
+        pub state_diff_commitment: Option<StateDiffCommitment>,
+        pub transaction_commitment: Option<TransactionCommitment>,
+        pub event_commitment: Option<EventCommitment>,
+        pub n_transactions: Option<usize>,
+        pub n_events: Option<usize>,
         pub starknet_version: StarknetVersion,
     }
     pub struct BlockNumber(pub u64);
@@ -641,6 +651,7 @@ auto_impl_get_test_instance! {
     pub struct Nonce(pub StarkFelt);
     pub struct TransactionCommitment(pub StarkHash);
     pub struct PaymasterData(pub Vec<StarkFelt>);
+    pub struct PoseidonHash(pub StarkFelt);
     pub struct Program {
         pub attributes: serde_json::Value,
         pub builtins: serde_json::Value,
@@ -675,6 +686,7 @@ auto_impl_get_test_instance! {
         pub nonces: IndexMap<ContractAddress, Nonce>,
         pub replaced_classes: IndexMap<ContractAddress, ClassHash>,
     }
+    pub struct StateDiffCommitment(pub PoseidonHash);
     pub struct StructMember {
         pub param: TypedParameter,
         pub offset: u64,
@@ -697,7 +709,10 @@ auto_impl_get_test_instance! {
     }
     pub enum TransactionExecutionStatus {
         Succeeded = 0,
-        Reverted = 1,
+        Reverted(RevertedTransactionExecutionStatus) = 1,
+    }
+    pub struct RevertedTransactionExecutionStatus {
+        pub revert_reason: String,
     }
     pub struct TransactionHash(pub StarkHash);
     pub struct TransactionOffsetInBlock(pub u64);
@@ -949,12 +964,19 @@ impl GetTestInstance for Hint {
 
 impl GetTestInstance for ExecutionResources {
     fn get_test_instance(rng: &mut ChaCha8Rng) -> Self {
-        let rand_not_zero = || max(1, get_rng().next_u64());
         let builtin = Builtin::get_test_instance(rng);
         Self {
-            steps: rand_not_zero(),
-            builtin_instance_counter: [(builtin, rand_not_zero())].into(),
-            memory_holes: rand_not_zero(),
+            steps: NonZeroU64::get_test_instance(rng).into(),
+            builtin_instance_counter: [(builtin, NonZeroU64::get_test_instance(rng).into())].into(),
+            memory_holes: NonZeroU64::get_test_instance(rng).into(),
+            da_l1_gas_consumed: rng.next_u64(),
+            da_l1_data_gas_consumed: rng.next_u64(),
         }
+    }
+}
+
+impl GetTestInstance for NonZeroU64 {
+    fn get_test_instance(rng: &mut ChaCha8Rng) -> Self {
+        max(1, rng.next_u64()).try_into().expect("Failed to convert a non-zero u64 to NonZeroU64")
     }
 }

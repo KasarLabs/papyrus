@@ -10,6 +10,7 @@ members = [
     "crates/papyrus_monitoring_gateway",
     "crates/papyrus_node",
     "crates/papyrus_network",
+    "crates/papyrus_p2p_sync",
     "crates/papyrus_proc_macros",
     "crates/papyrus_rpc",
     "crates/papyrus_storage",
@@ -19,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0-rc.0"
+version = "0.3.0"
 edition = "2021"
 repository = "https://github.com/starkware-libs/papyrus/"
 license = "Apache-2.0"
@@ -27,13 +28,14 @@ license-file = "LICENSE"
 
 [workspace.dependencies]
 anyhow = "1.0.44"
+assert-json-diff = "2.0.2"
 assert_matches = "1.5.0"
 async-stream = "0.3.3"
 async-trait = "0.1.56"
 axum = "0.6.12"
 base64 = "0.13.0"
 bitvec = "1.0.1"
-blockifier = "0.5.0-rc.0"
+blockifier = "0.5.0"
 bytes = "1"
 byteorder = "1.4.3"
 cairo-lang-casm = { git = "https://github.com/kasarlabs/cairo.git", branch = "feature/scale-codec" }
@@ -43,7 +45,9 @@ cairo-vm = { git = "https://github.com/kasarlabs/cairo-vm.git", branch = "featur
 camelpaste = "0.1.0"
 chrono = "0.4.26"
 clap = { version = "4.3.10" }
+colored = "2.1.0"
 const_format = "0.2.30"
+deadqueue = "0.2.4"
 defaultmap = "0.5.0"
 derive_more = "0.99.16"
 enum-iterator = "1.4.1"
@@ -101,13 +105,14 @@ serde_repr = "0.1"
 serde_yaml = "0.9.16"
 sha3 = "0.10.8"
 simple_logger = "4.0.0"
-starknet_api = { git = "https://github.com/bidzyyys/starknet-api.git", branch = "feature/scale-codec" }
+starknet_api = { git = "https://github.com/kasarlabs/starknet-api.git", branch = "feature/scale-codec" }
 starknet-core = "0.6.0"
 starknet-crypto = "0.5.1"
 strum = "0.25.0"
 strum_macros = "0.25.2"
 tempfile = "3.3.0"
 test-case = "3.2.1"
+test-log = "0.2.14"
 thiserror = "1.0.31"
 tokio = "1.18.2"
 tokio-retry = "0.3"

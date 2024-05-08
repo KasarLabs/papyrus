@@ -8,9 +8,13 @@ use papyrus_storage::{open_storage, StorageConfig};
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Address this node listens on for incoming connections.
+    /// Port this node listens on for incoming tcp connections.
     #[arg(short, long)]
-    listen_address: String,
+    tcp_port: u16,
+
+    /// Port this node listens on for incoming quic connections.
+    #[arg(short, long)]
+    quic_port: u16,
 
     /// Address this node attempts to dial to.
     #[arg(short, long)]
@@ -29,15 +33,19 @@ async fn main() {
         open_storage(StorageConfig::default()).expect("failed to open storage");
     let mut network_manager = network_manager::NetworkManager::new(
         NetworkConfig {
-            listen_addresses: vec![args.listen_address],
+            tcp_port: args.tcp_port,
+            quic_port: args.quic_port,
             session_timeout: Duration::from_secs(10),
             idle_connection_timeout: Duration::from_secs(args.idle_connection_timeout),
             header_buffer_size: 100000,
+            peer: None,
         },
         storage_reader,
     );
+    // TODO: use peer config from the network config and remove the dial function from the network
+    // manager (use the dial within the run function instead of here).
     if let Some(dial_address) = args.dial_address.as_ref() {
         network_manager.dial(dial_address);
     }
-    network_manager.run().await;
+    network_manager.run().await.expect("Network manager failed");
 }

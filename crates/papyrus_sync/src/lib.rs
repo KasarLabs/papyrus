@@ -34,7 +34,7 @@ use papyrus_storage::{StorageError, StorageReader, StorageWriter};
 use serde::{Deserialize, Serialize};
 use sources::base_layer::BaseLayerSourceError;
 use starknet_api::block::{Block, BlockHash, BlockNumber, BlockSignature};
-use starknet_api::core::{ClassHash, CompiledClassHash};
+use starknet_api::core::{ClassHash, CompiledClassHash, SequencerPublicKey};
 use starknet_api::deprecated_contract_class::ContractClass as DeprecatedContractClass;
 use starknet_api::state::StateDiff;
 use starknet_client::reader::PendingData;
@@ -63,6 +63,7 @@ pub struct SyncConfig {
     pub recoverable_error_sleep_duration: Duration,
     pub blocks_max_stream_size: u32,
     pub state_updates_max_stream_size: u32,
+    pub verify_blocks: bool,
 }
 
 impl SerializeConfig for SyncConfig {
@@ -99,6 +100,12 @@ impl SerializeConfig for SyncConfig {
                 "Max amount of state updates to download in a stream.",
                 ParamPrivacyInput::Public,
             ),
+            ser_param(
+                "verify_blocks",
+                &self.verify_blocks,
+                "Whether to verify incoming blocks.",
+                ParamPrivacyInput::Public,
+            ),
         ])
     }
 }
@@ -111,6 +118,7 @@ impl Default for SyncConfig {
             recoverable_error_sleep_duration: Duration::from_secs(3),
             blocks_max_stream_size: 1000,
             state_updates_max_stream_size: 1000,
+            verify_blocks: true,
         }
     }
 }
@@ -131,10 +139,12 @@ pub struct GenericStateSync<
     base_layer_source: Arc<TBaseLayerSource>,
     reader: StorageReader,
     writer: StorageWriter,
+    sequencer_pub_key: Option<SequencerPublicKey>,
 }
 
 pub type StateSyncResult = Result<(), StateSyncError>;
 
+// TODO: Sort alphabetically.
 #[derive(thiserror::Error, Debug)]
 pub enum StateSyncError {
     #[error("Sync stopped progress.")]
@@ -167,6 +177,8 @@ pub enum StateSyncError {
         base_layer_hash: BlockHash,
         l2_hash: BlockHash,
     },
+    #[error("Sequencer public key changed from {old:?} to {new:?}.")]
+    SequencerPubKeyChanged { old: SequencerPublicKey, new: SequencerPublicKey },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -253,11 +265,39 @@ impl<
         }
     }
 
+    async fn track_sequencer_public_key_changes(&mut self) -> StateSyncResult {
+        let sequencer_pub_key = self.central_source.get_sequencer_pub_key().await?;
+        match self.sequencer_pub_key {
+            // First time setting the sequencer public key.
+            None => {
+                info!("Sequencer public key set to {sequencer_pub_key:?}.");
+                self.sequencer_pub_key = Some(sequencer_pub_key);
+            }
+            Some(cur_key) => {
+                if cur_key != sequencer_pub_key {
+                    warn!(
+                        "Sequencer public key changed from {cur_key:?} to {sequencer_pub_key:?}."
+                    );
+                    // TODO: Add alert.
+                    self.sequencer_pub_key = Some(sequencer_pub_key);
+                    return Err(StateSyncError::SequencerPubKeyChanged {
+                        old: cur_key,
+                        new: sequencer_pub_key,
+                    });
+                }
+            }
+        };
+        Ok(())
+    }
+
     // Sync until encountering an error:
     //  1. If needed, revert blocks from the end of the chain.
     //  2. Create infinite block and state diff streams to fetch data from the central source.
     //  3. Fetch data from the streams with unblocking wait while there is no new data.
     async fn sync_while_ok(&mut self) -> StateSyncResult {
+        if self.config.verify_blocks {
+            self.track_sequencer_public_key_changes().await?;
+        }
         self.handle_block_reverts().await?;
         let block_stream = stream_new_blocks(
             self.reader.clone(),
@@ -711,6 +751,7 @@ impl StateSync {
             base_layer_source: Arc::new(base_layer_source),
             reader,
             writer,
+            sequencer_pub_key: None,
         }
     }
 }

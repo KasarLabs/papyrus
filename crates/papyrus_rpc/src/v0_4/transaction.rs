@@ -493,6 +493,7 @@ pub struct DeclareTransactionOutput {
     pub actual_fee: Fee,
     pub messages_sent: Vec<MessageToL1>,
     pub events: Vec<starknet_api::transaction::Event>,
+    #[serde(flatten)]
     pub execution_status: TransactionExecutionStatus,
 }
 
@@ -504,6 +505,7 @@ pub struct DeployAccountTransactionOutput {
     pub messages_sent: Vec<MessageToL1>,
     pub events: Vec<starknet_api::transaction::Event>,
     pub contract_address: ContractAddress,
+    #[serde(flatten)]
     pub execution_status: TransactionExecutionStatus,
 }
 
@@ -515,6 +517,7 @@ pub struct DeployTransactionOutput {
     pub messages_sent: Vec<MessageToL1>,
     pub events: Vec<starknet_api::transaction::Event>,
     pub contract_address: ContractAddress,
+    #[serde(flatten)]
     pub execution_status: TransactionExecutionStatus,
 }
 
@@ -525,6 +528,7 @@ pub struct InvokeTransactionOutput {
     pub actual_fee: Fee,
     pub messages_sent: Vec<MessageToL1>,
     pub events: Vec<starknet_api::transaction::Event>,
+    #[serde(flatten)]
     pub execution_status: TransactionExecutionStatus,
 }
 
@@ -535,6 +539,7 @@ pub struct L1HandlerTransactionOutput {
     pub actual_fee: Fee,
     pub messages_sent: Vec<MessageToL1>,
     pub events: Vec<starknet_api::transaction::Event>,
+    #[serde(flatten)]
     pub execution_status: TransactionExecutionStatus,
 }
 
@@ -556,17 +561,6 @@ pub enum PendingTransactionOutput {
 }
 
 impl TransactionOutput {
-    #[cfg(test)]
-    pub fn execution_status(&self) -> &TransactionExecutionStatus {
-        match self {
-            TransactionOutput::Declare(tx_output) => &tx_output.execution_status,
-            TransactionOutput::Deploy(tx_output) => &tx_output.execution_status,
-            TransactionOutput::DeployAccount(tx_output) => &tx_output.execution_status,
-            TransactionOutput::Invoke(tx_output) => &tx_output.execution_status,
-            TransactionOutput::L1Handler(tx_output) => &tx_output.execution_status,
-        }
-    }
-
     pub fn from_thin_transaction_output(
         thin_tx_output: ThinTransactionOutput,
         events: Vec<starknet_api::transaction::Event>,

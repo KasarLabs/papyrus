@@ -18,10 +18,11 @@ use starknet_api::core::{
     EventCommitment,
     GlobalRoot,
     SequencerContractAddress,
+    StateDiffCommitment,
     TransactionCommitment,
 };
 use starknet_api::data_availability::L1DataAvailabilityMode;
-use starknet_api::hash::StarkFelt;
+use starknet_api::hash::{PoseidonHash, StarkFelt};
 #[cfg(doc)]
 use starknet_api::transaction::TransactionOutput as starknet_api_transaction_output;
 use starknet_api::transaction::{TransactionHash, TransactionOffsetInBlock};
@@ -60,9 +61,12 @@ pub struct DeprecatedBlock {
 }
 
 impl DeprecatedBlock {
-    pub fn to_starknet_api_block_and_version(self) -> ReaderClientResult<starknet_api_block> {
+    pub fn to_starknet_api_block_and_version(
+        self,
+        state_diff_hash: GlobalRoot,
+    ) -> ReaderClientResult<starknet_api_block> {
         let block_or_deprecated = BlockOrDeprecated::Deprecated(self);
-        block_or_deprecated.to_starknet_api_block_and_version()
+        block_or_deprecated.to_starknet_api_block_and_version(state_diff_hash)
     }
 }
 
@@ -73,12 +77,16 @@ pub struct Block {
     pub block_hash: BlockHash,
     pub block_number: BlockNumber,
     pub parent_block_hash: BlockHash,
+    #[serde(default)]
     pub sequencer_address: SequencerContractAddress,
     pub state_root: GlobalRoot,
     pub status: BlockStatus,
+    #[serde(default)]
     pub timestamp: BlockTimestamp,
     pub transactions: Vec<Transaction>,
     pub transaction_receipts: Vec<TransactionReceipt>,
+    // Default since old blocks don't include this field.
+    #[serde(default)]
     pub starknet_version: String,
     // Additions to the block structure in V0.13.1.
     pub l1_da_mode: L1DataAvailabilityMode,
@@ -90,9 +98,12 @@ pub struct Block {
 }
 
 impl Block {
-    pub fn to_starknet_api_block_and_version(self) -> ReaderClientResult<starknet_api_block> {
+    pub fn to_starknet_api_block_and_version(
+        self,
+        state_diff_hash: GlobalRoot,
+    ) -> ReaderClientResult<starknet_api_block> {
         let block_or_deprecated = BlockOrDeprecated::Current(self);
-        block_or_deprecated.to_starknet_api_block_and_version()
+        block_or_deprecated.to_starknet_api_block_and_version(state_diff_hash)
     }
 }
 
@@ -277,7 +288,11 @@ impl BlockOrDeprecated {
     }
 
     // TODO(shahak): Rename to to_starknet_api_block.
-    pub fn to_starknet_api_block_and_version(self) -> ReaderClientResult<starknet_api_block> {
+    pub fn to_starknet_api_block_and_version(
+        self,
+        // TODO(yair): Change to StateDiffCommitment.
+        state_diff_commitment: GlobalRoot,
+    ) -> ReaderClientResult<starknet_api_block> {
         // Check that the number of receipts is the same as the number of transactions.
         let num_of_txs = self.transactions().len();
         let num_of_receipts = self.transaction_receipts().len();
@@ -291,6 +306,32 @@ impl BlockOrDeprecated {
             ));
         }
 
+        let (transaction_commitment, event_commitment, n_transactions, n_events) = match &self {
+            BlockOrDeprecated::Deprecated(..) => (None, None, None, None),
+            BlockOrDeprecated::Current(block) => {
+                // In some older starknet versions, the transaction and event commitments are not
+                // available from the feeder gateway. In such cases, we return None for these
+                // fields.
+                if block.transaction_commitment == TransactionCommitment::default()
+                    && block.event_commitment == EventCommitment::default()
+                {
+                    (None, None, None, None)
+                } else {
+                    (
+                        Some(block.transaction_commitment),
+                        Some(block.event_commitment),
+                        Some(block.transactions.len()),
+                        Some(
+                            block
+                                .transaction_receipts
+                                .iter()
+                                .fold(0, |acc, receipt| acc + receipt.events.len()),
+                        ),
+                    )
+                }
+            }
+        };
+
         // Get the header.
         let header = starknet_api::block::BlockHeader {
             block_hash: self.block_hash(),
@@ -302,13 +343,11 @@ impl BlockOrDeprecated {
             timestamp: self.timestamp(),
             l1_data_gas_price: self.l1_data_gas_price(),
             l1_da_mode: self.l1_da_mode(),
-            transaction_commitment: self.transaction_commitment(),
-            event_commitment: self.event_commitment(),
-            n_transactions: self.transactions().len(),
-            n_events: self
-                .transaction_receipts()
-                .iter()
-                .fold(0, |acc, receipt| acc + receipt.events.len()),
+            state_diff_commitment: Some(StateDiffCommitment(PoseidonHash(state_diff_commitment.0))),
+            transaction_commitment,
+            event_commitment,
+            n_transactions: n_transactions.map(|x| x as u64),
+            n_events: n_events.map(|x| x as u64),
             starknet_version: StarknetVersion(self.starknet_version()),
         };
 
@@ -322,11 +361,11 @@ impl BlockOrDeprecated {
 
             // Check that the transaction index that appears in the receipt is the same as the
             // index of the transaction.
-            if i != receipt.transaction_index.0 {
+            if i as u64 != receipt.transaction_index.0 {
                 return Err(ReaderClientError::TransactionReceiptsError(
                     TransactionReceiptsError::MismatchTransactionIndex {
                         block_number: header.block_number,
-                        tx_index: TransactionOffsetInBlock(i),
+                        tx_index: TransactionOffsetInBlock(i as u64),
                         tx_hash: transaction.transaction_hash(),
                         receipt_tx_index: receipt.transaction_index,
                     },
@@ -339,7 +378,7 @@ impl BlockOrDeprecated {
                 return Err(ReaderClientError::TransactionReceiptsError(
                     TransactionReceiptsError::MismatchTransactionHash {
                         block_number: header.block_number,
-                        tx_index: TransactionOffsetInBlock(i),
+                        tx_index: TransactionOffsetInBlock(i as u64),
                         tx_hash: transaction.transaction_hash(),
                         receipt_tx_hash: receipt.transaction_hash,
                     },
@@ -353,7 +392,7 @@ impl BlockOrDeprecated {
                 return Err(ReaderClientError::TransactionReceiptsError(
                     TransactionReceiptsError::MismatchFields {
                         block_number: header.block_number,
-                        tx_index: TransactionOffsetInBlock(i),
+                        tx_index: TransactionOffsetInBlock(i as u64),
                         tx_hash: transaction.transaction_hash(),
                         tx_type: transaction.transaction_type(),
                     },
@@ -438,6 +477,6 @@ pub struct BlockSignatureData {
 )]
 pub struct BlockSignatureMessage {
     pub block_hash: BlockHash,
-    // TODO(yair): Consider renaming GlobalRoot to PatriciaRoot.
+    // TODO(yair): Change to StateDiffHash.
     pub state_diff_commitment: GlobalRoot,
 }

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use indexmap::IndexMap;
 pub use papyrus_common::state::{
     DeclaredClassHashEntry,
@@ -57,7 +55,7 @@ impl StateDiff {
 #[derive(Debug, Clone, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ContractClass {
     pub sierra_program: Vec<StarkFelt>,
-    pub entry_points_by_type: HashMap<EntryPointType, Vec<EntryPoint>>,
+    pub entry_points_by_type: IndexMap<EntryPointType, Vec<EntryPoint>>,
     pub contract_class_version: String,
     pub abi: String,
 }

@@ -31,14 +31,16 @@ use starknet_api::transaction::{
     MessageToL1,
     PaymasterData,
     ResourceBoundsMapping,
+    RevertedTransactionExecutionStatus as SnApiRevertedTransactionExecutionStatus,
     Tip,
-    TransactionExecutionStatus,
+    TransactionExecutionStatus as SnApiTransactionExecutionStatus,
     TransactionHash,
     TransactionOffsetInBlock,
     TransactionOutput,
     TransactionSignature,
     TransactionVersion,
 };
+use tracing::error;
 
 use crate::reader::ReaderClientError;
 
@@ -605,12 +607,25 @@ impl TryFrom<IntermediateInvokeTransaction> for starknet_api::transaction::Invok
 
 /// The execution resources used by a transaction.
 #[derive(Debug, Default, Deserialize, Serialize, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionResources {
     // Note: in starknet_api this field is named `steps`
     pub n_steps: u64,
     pub builtin_instance_counter: HashMap<Builtin, u64>,
     // Note: in starknet_api this field is named `memory_holes`
     pub n_memory_holes: u64,
+    // This field was added in Starknet v0.13.1
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_availability: Option<DataAvailabilityResources>,
+}
+
+/// The resources used for data availability by a transaction.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DataAvailabilityResources {
+    pub l1_gas: u64,
+    pub l1_data_gas: u64,
 }
 
 // Note: the serialization is different from the one in starknet_api.
@@ -666,11 +681,22 @@ impl From<ExecutionResources> for starknet_api::transaction::ExecutionResources 
                 })
                 .collect(),
             memory_holes: execution_resources.n_memory_holes,
+            da_l1_gas_consumed: execution_resources
+                .data_availability
+                .as_ref()
+                .map(|data_availability| data_availability.l1_gas)
+                .unwrap_or_default(),
+            da_l1_data_gas_consumed: execution_resources
+                .data_availability
+                .as_ref()
+                .map(|data_availability| data_availability.l1_data_gas)
+                .unwrap_or_default(),
         }
     }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TransactionReceipt {
     pub transaction_index: TransactionOffsetInBlock,
     pub transaction_hash: TransactionHash,
@@ -681,8 +707,24 @@ pub struct TransactionReceipt {
     #[serde(default)]
     pub execution_resources: ExecutionResources,
     pub actual_fee: Fee,
+    // TODO: Check if we can remove the serde(default).
     #[serde(default)]
     pub execution_status: TransactionExecutionStatus,
+    // Note that in starknet_api this field is named `revert_reason`.
+    // Assumption: if the transaction execution status is Succeeded, then revert_error is None, and
+    // if the transaction execution status is Reverted, then revert_error is Some.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert_error: Option<String>,
+}
+
+/// Transaction execution status.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, PartialOrd, Ord, Default)]
+pub enum TransactionExecutionStatus {
+    #[serde(rename = "SUCCEEDED")]
+    #[default]
+    Succeeded,
+    #[serde(rename = "REVERTED")]
+    Reverted,
 }
 
 impl TransactionReceipt {
@@ -690,14 +732,34 @@ impl TransactionReceipt {
         self,
         transaction: &Transaction,
     ) -> TransactionOutput {
-        let messages_sent = self.l2_to_l1_messages.into_iter().map(MessageToL1::from).collect();
         let contract_address = transaction.contract_address();
+        let execution_status = match &self.execution_status {
+            TransactionExecutionStatus::Succeeded => {
+                if self.revert_error.is_some() {
+                    error!(
+                        "Transaction execution status is Succeeded, but revert_error is not None: \
+                         {:?}",
+                        self
+                    );
+                }
+                SnApiTransactionExecutionStatus::Succeeded
+            }
+            TransactionExecutionStatus::Reverted => {
+                SnApiTransactionExecutionStatus::Reverted(SnApiRevertedTransactionExecutionStatus {
+                    revert_reason: self.revert_error.clone().unwrap_or_else(|| {
+                        error!("Reverted transaction without a revert reason: {:?}", self);
+                        "Reverted without a reason".to_owned()
+                    }),
+                })
+            }
+        };
+        let messages_sent = self.l2_to_l1_messages.into_iter().map(MessageToL1::from).collect();
         match transaction.transaction_type() {
             TransactionType::Declare => TransactionOutput::Declare(DeclareTransactionOutput {
                 actual_fee: self.actual_fee,
                 messages_sent,
                 events: self.events,
-                execution_status: self.execution_status,
+                execution_status,
                 execution_resources: self.execution_resources.into(),
             }),
             TransactionType::Deploy => TransactionOutput::Deploy(DeployTransactionOutput {
@@ -706,7 +768,7 @@ impl TransactionReceipt {
                 events: self.events,
                 contract_address: contract_address
                     .expect("Deploy transaction must have a contract address."),
-                execution_status: self.execution_status,
+                execution_status,
                 execution_resources: self.execution_resources.into(),
             }),
             TransactionType::DeployAccount => {
@@ -716,7 +778,7 @@ impl TransactionReceipt {
                     events: self.events,
                     contract_address: contract_address
                         .expect("Deploy account transaction must have a contract address."),
-                    execution_status: self.execution_status,
+                    execution_status,
                     execution_resources: self.execution_resources.into(),
                 })
             }
@@ -724,7 +786,7 @@ impl TransactionReceipt {
                 actual_fee: self.actual_fee,
                 messages_sent,
                 events: self.events,
-                execution_status: self.execution_status,
+                execution_status,
                 execution_resources: self.execution_resources.into(),
             }),
             TransactionType::L1Handler => {
@@ -732,7 +794,7 @@ impl TransactionReceipt {
                     actual_fee: self.actual_fee,
                     messages_sent,
                     events: self.events,
-                    execution_status: self.execution_status,
+                    execution_status,
                     execution_resources: self.execution_resources.into(),
                 })
             }

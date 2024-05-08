@@ -104,6 +104,87 @@ expression: dumped_default_config
     "value": "https://alpha-mainnet.starknet.io/",
     "privacy": "Public"
   },
+  "network.#is_none": {
+    "description": "Flag for an optional field",
+    "value": true,
+    "privacy": "TemporaryValue"
+  },
+  "network.header_buffer_size": {
+    "description": "Size of the buffer for headers read from the storage.",
+    "value": {
+      "$serde_json::private::Number": "100000"
+    },
+    "privacy": "Public"
+  },
+  "network.idle_connection_timeout": {
+    "description": "Amount of time in seconds that a connection with no active sessions will stay alive.",
+    "value": {
+      "$serde_json::private::Number": "10"
+    },
+    "privacy": "Public"
+  },
+  "network.peer.#is_none": {
+    "description": "Flag for an optional field",
+    "value": true,
+    "privacy": "TemporaryValue"
+  },
+  "network.peer.ip": {
+    "description": "The ipv4 address of another peer that the node will dial to.",
+    "value": "127.0.0.1",
+    "privacy": "Public"
+  },
+  "network.peer.peer_id": {
+    "description": "Peer ID to send requests to. If not set, the node will not send requests. for info: https://docs.libp2p.io/concepts/fundamentals/peers/",
+    "value": "QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N",
+    "privacy": "Public"
+  },
+  "network.peer.tcp_port": {
+    "description": "The port on the other peer that the node will dial to to use for TCP transport.",
+    "value": {
+      "$serde_json::private::Number": "10002"
+    },
+    "privacy": "Public"
+  },
+  "network.quic_port": {
+    "description": "The port that the node listens on for incoming quic connections.",
+    "value": {
+      "$serde_json::private::Number": "10001"
+    },
+    "privacy": "Public"
+  },
+  "network.session_timeout": {
+    "description": "Maximal time in seconds that each session can take before failing on timeout.",
+    "value": {
+      "$serde_json::private::Number": "10"
+    },
+    "privacy": "Public"
+  },
+  "network.tcp_port": {
+    "description": "The port that the node listens on for incoming tcp connections.",
+    "value": {
+      "$serde_json::private::Number": "10000"
+    },
+    "privacy": "Public"
+  },
+  "p2p_sync.#is_none": {
+    "description": "Flag for an optional field",
+    "value": true,
+    "privacy": "TemporaryValue"
+  },
+  "p2p_sync.num_headers_per_query": {
+    "description": "The maximum amount of headers to ask from peers in each iteration.",
+    "value": {
+      "$serde_json::private::Number": "10000"
+    },
+    "privacy": "Public"
+  },
+  "p2p_sync.query_timeout": {
+    "description": "Time in seconds to wait for query responses until we mark it as failed",
+    "value": {
+      "$serde_json::private::Number": "5"
+    },
+    "privacy": "Public"
+  },
   "rpc.chain_id": {
     "description": "The chain to follow. For more details see https://docs.starknet.io/documentation/architecture_and_concepts/Blocks/transactions/#chain-id.",
     "value": "SN_MAIN",
@@ -264,6 +345,11 @@ expression: dumped_default_config
     "value": {
       "$serde_json::private::Number": "1000"
     },
+    "privacy": "Public"
+  },
+  "sync.verify_blocks": {
+    "description": "Whether to verify incoming blocks.",
+    "value": true,
     "privacy": "Public"
   }
 }

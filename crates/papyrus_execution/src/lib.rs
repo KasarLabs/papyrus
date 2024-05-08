@@ -19,6 +19,7 @@ mod test_utils;
 pub mod testing_instances;
 
 pub mod objects;
+
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU128;
 use std::sync::Arc;
@@ -26,12 +27,11 @@ use std::sync::Arc;
 use blockifier::block::{pre_process_block, BlockInfo, BlockNumberHashPair, GasPrices};
 use blockifier::context::{BlockContext, ChainInfo, FeeTokenAddresses, TransactionContext};
 use blockifier::execution::call_info::CallExecution;
-use blockifier::execution::contract_class::ContractClass as BlockifierContractClass;
+use blockifier::execution::contract_class::{ClassInfo, ContractClass as BlockifierContractClass};
 use blockifier::execution::entry_point::{
     CallEntryPoint,
     CallType as BlockifierCallType,
     EntryPointExecutionContext,
-    ExecutionResources,
 };
 use blockifier::state::cached_state::{CachedState, GlobalContractCache};
 use blockifier::transaction::errors::TransactionExecutionError as BlockifierTransactionExecutionError;
@@ -44,15 +44,16 @@ use blockifier::transaction::transaction_execution::Transaction as BlockifierTra
 use blockifier::transaction::transactions::ExecutableTransaction;
 use blockifier::versioned_constants::VersionedConstants;
 use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
+use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use execution_utils::{get_trace_constructor, induced_state_diff};
-use objects::{PriceUnit, TransactionSimulationOutput};
 use papyrus_common::transaction_hash::get_transaction_hash;
 use papyrus_common::TransactionOptions;
 use papyrus_storage::header::HeaderStorageReader;
 use papyrus_storage::{StorageError, StorageReader};
 use serde::{Deserialize, Serialize};
-use starknet_api::block::{BlockNumber, GasPrice};
+use starknet_api::block::BlockNumber;
 use starknet_api::core::{ChainId, ClassHash, ContractAddress, EntryPointSelector, PatriciaKey};
+use starknet_api::data_availability::L1DataAvailabilityMode;
 // TODO: merge multiple EntryPointType structs in SN_API into one.
 use starknet_api::deprecated_contract_class::{
     ContractClass as DeprecatedContractClass,
@@ -78,7 +79,13 @@ use starknet_api::{contract_address, patricia_key, StarknetApiError};
 use state_reader::ExecutionStateReader;
 use tracing::trace;
 
-use crate::objects::PendingData;
+use crate::objects::{
+    tx_execution_output_to_fee_estimation,
+    FeeEstimation,
+    PendingData,
+    PriceUnit,
+    TransactionSimulationOutput,
+};
 
 // TODO(yair): understand what it is and whether the use of this constant should change.
 const GLOBAL_CONTRACT_CACHE_SIZE: usize = 100;
@@ -146,6 +153,12 @@ impl ExecutionConfigByBlock {
 /// The error type for the execution module.
 #[derive(thiserror::Error, Debug)]
 pub enum ExecutionError {
+    #[error("Bad declare tx: {tx:?}. error: {err:?}")]
+    BadDeclareTransaction {
+        tx: DeclareTransaction,
+        #[source]
+        err: blockifier::execution::errors::ContractClassError,
+    },
     #[error("Execution config file does not contain a configuration for all blocks")]
     ConfigContentError,
     #[error(transparent)]
@@ -159,6 +172,8 @@ pub enum ExecutionError {
          {state_number:?}."
     )]
     ContractNotFound { contract_address: ContractAddress, state_number: StateNumber },
+    #[error("Gas consumed should fit into u64")]
+    GasConsumedOutOfRange,
     #[error("Missing class hash in call info")]
     MissingClassHash,
     #[error("Missing compiled class with hash {class_hash} (The CASM table isn't synced)")]
@@ -167,6 +182,8 @@ pub enum ExecutionError {
     StateError(#[from] blockifier::state::errors::StateError),
     #[error(transparent)]
     StorageError(#[from] StorageError),
+    #[error(transparent)]
+    TransactionFeeError(#[from] blockifier::transaction::errors::TransactionFeeError),
     #[error(
         "Execution failed at transaction {transaction_index:?} with error: {execution_error:?}"
     )]
@@ -195,6 +212,7 @@ pub fn execute_call(
     entry_point_selector: EntryPointSelector,
     calldata: Calldata,
     execution_config: &BlockExecutionConfig,
+    override_kzg_da_to_false: bool,
 ) -> ExecutionResult<CallExecution> {
     verify_contract_exists(
         *contract_address,
@@ -233,6 +251,7 @@ pub fn execute_call(
         &storage_reader,
         maybe_pending_data.as_ref(),
         execution_config,
+        override_kzg_da_to_false,
     )?;
 
     let mut context = EntryPointExecutionContext::new_invoke(
@@ -283,37 +302,55 @@ fn create_block_context(
     storage_reader: &StorageReader,
     maybe_pending_data: Option<&PendingData>,
     execution_config: &BlockExecutionConfig,
+    // TODO(shahak): Remove this once we stop supporting rpc v0.6.
+    override_kzg_da_to_false: bool,
 ) -> ExecutionResult<BlockContext> {
-    let (block_number, block_timestamp, l1_gas_price, l1_data_gas_price, sequencer_address) =
-        match maybe_pending_data {
-            Some(pending_data) => (
-                block_context_number.next(),
-                pending_data.timestamp,
-                pending_data.l1_gas_price,
-                pending_data.l1_data_gas_price,
-                pending_data.sequencer,
-            ),
-            None => {
-                let header = storage_reader
-                    .begin_ro_txn()?
-                    .get_block_header(block_context_number)?
-                    .expect("Should have block header.");
-                (
-                    header.block_number,
-                    header.timestamp,
-                    header.l1_gas_price,
-                    header.l1_data_gas_price,
-                    header.sequencer,
-                )
-            }
-        };
+    let (
+        block_number,
+        block_timestamp,
+        l1_gas_price,
+        l1_data_gas_price,
+        sequencer_address,
+        l1_da_mode,
+    ) = match maybe_pending_data {
+        Some(pending_data) => (
+            block_context_number.next(),
+            pending_data.timestamp,
+            pending_data.l1_gas_price,
+            pending_data.l1_data_gas_price,
+            pending_data.sequencer,
+            pending_data.l1_da_mode,
+        ),
+        None => {
+            let header = storage_reader
+                .begin_ro_txn()?
+                .get_block_header(block_context_number)?
+                .expect("Should have block header.");
+            (
+                header.block_number,
+                header.timestamp,
+                header.l1_gas_price,
+                header.l1_data_gas_price,
+                header.sequencer,
+                header.l1_da_mode,
+            )
+        }
+    };
     let ten_blocks_ago = get_10_blocks_ago(&block_context_number, cached_state)?;
+
+    let use_kzg_da = if override_kzg_da_to_false {
+        false
+    } else {
+        match l1_da_mode {
+            L1DataAvailabilityMode::Calldata => false,
+            L1DataAvailabilityMode::Blob => true,
+        }
+    };
 
     let block_info = BlockInfo {
         block_timestamp,
         sequencer_address: sequencer_address.0,
-        // TODO(yair): set to true when da mode is Blob (not supported yet).
-        use_kzg_da: false,
+        use_kzg_da,
         block_number,
         // TODO(yair): What to do about blocks pre 0.13.1 where the data gas price were 0?
         gas_prices: GasPrices {
@@ -348,6 +385,14 @@ fn create_block_context(
     )?)
 }
 
+/// The size of the json string representing the abi of a class or deprecated class.
+pub type AbiSize = usize;
+
+/// The size of the sierra program.
+pub type SierraSize = usize;
+
+const DEPRECATED_CONTRACT_SIERRA_SIZE: SierraSize = 0;
+
 /// The transaction input to be executed.
 // TODO(yair): This should use broadcasted transactions instead of regular transactions, but the
 // blockifier expects regular transactions. Consider changing the blockifier to use broadcasted txs.
@@ -356,10 +401,10 @@ fn create_block_context(
 pub enum ExecutableTransactionInput {
     Invoke(InvokeTransaction, OnlyQuery),
     // todo(yair): Do we need to support V0?
-    DeclareV0(DeclareTransactionV0V1, DeprecatedContractClass, OnlyQuery),
-    DeclareV1(DeclareTransactionV0V1, DeprecatedContractClass, OnlyQuery),
-    DeclareV2(DeclareTransactionV2, CasmContractClass, OnlyQuery),
-    DeclareV3(DeclareTransactionV3, CasmContractClass, OnlyQuery),
+    DeclareV0(DeclareTransactionV0V1, DeprecatedContractClass, AbiSize, OnlyQuery),
+    DeclareV1(DeclareTransactionV0V1, DeprecatedContractClass, AbiSize, OnlyQuery),
+    DeclareV2(DeclareTransactionV2, CasmContractClass, SierraSize, AbiSize, OnlyQuery),
+    DeclareV3(DeclareTransactionV3, CasmContractClass, SierraSize, AbiSize, OnlyQuery),
     DeployAccount(DeployAccountTransaction, OnlyQuery),
     L1Handler(L1HandlerTransaction, Fee, OnlyQuery),
 }
@@ -390,37 +435,49 @@ impl ExecutableTransactionInput {
                 };
                 (Self::Invoke(tx, only_query), res)
             }
-            ExecutableTransactionInput::DeclareV0(tx, class, only_query) => {
+            ExecutableTransactionInput::DeclareV0(tx, class, abi_length, only_query) => {
                 let as_transaction = Transaction::Declare(DeclareTransaction::V0(tx));
                 let res = func(&as_transaction, only_query);
                 let Transaction::Declare(DeclareTransaction::V0(tx)) = as_transaction else {
                     unreachable!("Should be declare v0 transaction.")
                 };
-                (Self::DeclareV0(tx, class, only_query), res)
+                (Self::DeclareV0(tx, class, abi_length, only_query), res)
             }
-            ExecutableTransactionInput::DeclareV1(tx, class, only_query) => {
+            ExecutableTransactionInput::DeclareV1(tx, class, abi_length, only_query) => {
                 let as_transaction = Transaction::Declare(DeclareTransaction::V1(tx));
                 let res = func(&as_transaction, only_query);
                 let Transaction::Declare(DeclareTransaction::V1(tx)) = as_transaction else {
                     unreachable!("Should be declare v1 transaction.")
                 };
-                (Self::DeclareV1(tx, class, only_query), res)
+                (Self::DeclareV1(tx, class, abi_length, only_query), res)
             }
-            ExecutableTransactionInput::DeclareV2(tx, class, only_query) => {
+            ExecutableTransactionInput::DeclareV2(
+                tx,
+                class,
+                sierra_program_length,
+                abi_length,
+                only_query,
+            ) => {
                 let as_transaction = Transaction::Declare(DeclareTransaction::V2(tx));
                 let res = func(&as_transaction, only_query);
                 let Transaction::Declare(DeclareTransaction::V2(tx)) = as_transaction else {
                     unreachable!("Should be declare v2 transaction.")
                 };
-                (Self::DeclareV2(tx, class, only_query), res)
+                (Self::DeclareV2(tx, class, sierra_program_length, abi_length, only_query), res)
             }
-            ExecutableTransactionInput::DeclareV3(tx, class, only_query) => {
+            ExecutableTransactionInput::DeclareV3(
+                tx,
+                class,
+                sierra_program_length,
+                abi_length,
+                only_query,
+            ) => {
                 let as_transaction = Transaction::Declare(DeclareTransaction::V3(tx));
                 let res = func(&as_transaction, only_query);
                 let Transaction::Declare(DeclareTransaction::V3(tx)) = as_transaction else {
                     unreachable!("Should be declare v3 transaction.")
                 };
-                (Self::DeclareV3(tx, class, only_query), res)
+                (Self::DeclareV3(tx, class, sierra_program_length, abi_length, only_query), res)
             }
             ExecutableTransactionInput::DeployAccount(tx, only_query) => {
                 let as_transaction = Transaction::DeployAccount(tx);
@@ -479,7 +536,7 @@ pub struct RevertedTransaction {
 
 /// Valid output for fee estimation for a series of transactions can be either a list of fees or the
 /// index and revert reason of the first reverted transaction.
-pub type FeeEstimationResult = Result<Vec<(GasPrice, Fee, PriceUnit)>, RevertedTransaction>;
+pub type FeeEstimationResult = Result<Vec<FeeEstimation>, RevertedTransaction>;
 
 /// Returns the fee estimation for a series of transactions.
 #[allow(clippy::too_many_arguments)]
@@ -492,6 +549,7 @@ pub fn estimate_fee(
     block_context_block_number: BlockNumber,
     execution_config: &BlockExecutionConfig,
     validate: bool,
+    override_kzg_da_to_false: bool,
 ) -> ExecutionResult<FeeEstimationResult> {
     let (txs_execution_info, block_context) = execute_transactions(
         txs,
@@ -504,31 +562,19 @@ pub fn estimate_fee(
         execution_config,
         false,
         validate,
+        override_kzg_da_to_false,
     )?;
-    Ok(txs_execution_info
-        .into_iter()
-        .enumerate()
-        .map(|(index, tx_execution_output)| {
-            // If the transaction reverted, fail the entire estimation.
-            if let Some(revert_reason) = tx_execution_output.execution_info.revert_error {
-                Err(RevertedTransaction { index, revert_reason })
-            } else {
-                let gas_price = match tx_execution_output.price_unit {
-                    PriceUnit::Wei => {
-                        GasPrice(block_context.block_info().gas_prices.eth_l1_gas_price.get())
-                    }
-                    PriceUnit::Fri => {
-                        GasPrice(block_context.block_info().gas_prices.strk_l1_gas_price.get())
-                    }
-                };
-                Ok((
-                    gas_price,
-                    tx_execution_output.execution_info.actual_fee,
-                    tx_execution_output.price_unit,
-                ))
-            }
-        })
-        .collect())
+    let mut result = Vec::new();
+    for (index, tx_execution_output) in txs_execution_info.into_iter().enumerate() {
+        // If the transaction reverted, fail the entire estimation.
+        if let Some(revert_reason) = tx_execution_output.execution_info.revert_error {
+            return Ok(Err(RevertedTransaction { index, revert_reason }));
+        } else {
+            result
+                .push(tx_execution_output_to_fee_estimation(&tx_execution_output, &block_context)?);
+        }
+    }
+    Ok(Ok(result))
 }
 
 struct TransactionExecutionOutput {
@@ -551,6 +597,7 @@ fn execute_transactions(
     execution_config: &BlockExecutionConfig,
     charge_fee: bool,
     validate: bool,
+    override_kzg_da_to_false: bool,
 ) -> ExecutionResult<(Vec<TransactionExecutionOutput>, BlockContext)> {
     // The starknet state will be from right before the block in which the transactions should run.
     let mut cached_state = CachedState::new(
@@ -570,6 +617,7 @@ fn execute_transactions(
         &storage_reader,
         maybe_pending_data.as_ref(),
         execution_config,
+        override_kzg_da_to_false,
     )?;
 
     let (txs, tx_hashes) = match tx_hashes {
@@ -597,9 +645,11 @@ fn execute_transactions(
                 DeclareTransactionV0V1 { class_hash, .. },
                 _,
                 _,
+                _,
             ) => Some(*class_hash),
             ExecutableTransactionInput::DeclareV1(
                 DeclareTransactionV0V1 { class_hash, .. },
+                _,
                 _,
                 _,
             ) => Some(*class_hash),
@@ -688,7 +738,12 @@ fn to_blockifier_tx(
             .map_err(|err| ExecutionError::from((transaction_index, err)))
         }
 
-        ExecutableTransactionInput::DeclareV0(declare_tx, deprecated_class, only_query) => {
+        ExecutableTransactionInput::DeclareV0(
+            declare_tx,
+            deprecated_class,
+            abi_length,
+            only_query,
+        ) => {
             let class_v0 = BlockifierContractClass::V0(deprecated_class.try_into().map_err(
                 |e: cairo_vm::types::errors::program_errors::ProgramError| {
                     ExecutionError::TransactionExecutionError {
@@ -697,52 +752,93 @@ fn to_blockifier_tx(
                     }
                 },
             )?);
+            let class_info = ClassInfo::new(&class_v0, DEPRECATED_CONTRACT_SIERRA_SIZE, abi_length)
+                .map_err(|err| ExecutionError::BadDeclareTransaction {
+                    tx: DeclareTransaction::V0(declare_tx.clone()),
+                    err,
+                })?;
             BlockifierTransaction::from_api(
                 Transaction::Declare(DeclareTransaction::V0(declare_tx)),
                 tx_hash,
-                Some(class_v0),
+                Some(class_info),
                 None,
                 None,
                 only_query,
             )
             .map_err(|err| ExecutionError::from((transaction_index, err)))
         }
-        ExecutableTransactionInput::DeclareV1(declare_tx, deprecated_class, only_query) => {
+        ExecutableTransactionInput::DeclareV1(
+            declare_tx,
+            deprecated_class,
+            abi_length,
+            only_query,
+        ) => {
             let class_v0 = BlockifierContractClass::V0(
                 deprecated_class.try_into().map_err(BlockifierError::new)?,
             );
+            let class_info = ClassInfo::new(&class_v0, DEPRECATED_CONTRACT_SIERRA_SIZE, abi_length)
+                .map_err(|err| ExecutionError::BadDeclareTransaction {
+                    tx: DeclareTransaction::V1(declare_tx.clone()),
+                    err,
+                })?;
             BlockifierTransaction::from_api(
                 Transaction::Declare(DeclareTransaction::V1(declare_tx)),
                 tx_hash,
-                Some(class_v0),
+                Some(class_info),
                 None,
                 None,
                 only_query,
             )
             .map_err(|err| ExecutionError::from((transaction_index, err)))
         }
-        ExecutableTransactionInput::DeclareV2(declare_tx, compiled_class, only_query) => {
+        ExecutableTransactionInput::DeclareV2(
+            declare_tx,
+            compiled_class,
+            sierra_program_length,
+            abi_length,
+            only_query,
+        ) => {
             let class_v1 = BlockifierContractClass::V1(
                 compiled_class.try_into().map_err(BlockifierError::new)?,
             );
+            let class_info =
+                ClassInfo::new(&class_v1, sierra_program_length, abi_length).map_err(|err| {
+                    ExecutionError::BadDeclareTransaction {
+                        tx: DeclareTransaction::V2(declare_tx.clone()),
+                        err,
+                    }
+                })?;
             BlockifierTransaction::from_api(
                 Transaction::Declare(DeclareTransaction::V2(declare_tx)),
                 tx_hash,
-                Some(class_v1),
+                Some(class_info),
                 None,
                 None,
                 only_query,
             )
             .map_err(|err| ExecutionError::from((transaction_index, err)))
         }
-        ExecutableTransactionInput::DeclareV3(declare_tx, compiled_class, only_query) => {
+        ExecutableTransactionInput::DeclareV3(
+            declare_tx,
+            compiled_class,
+            sierra_program_length,
+            abi_length,
+            only_query,
+        ) => {
             let class_v1 = BlockifierContractClass::V1(
                 compiled_class.try_into().map_err(BlockifierError::new)?,
             );
+            let class_info =
+                ClassInfo::new(&class_v1, sierra_program_length, abi_length).map_err(|err| {
+                    ExecutionError::BadDeclareTransaction {
+                        tx: DeclareTransaction::V3(declare_tx.clone()),
+                        err,
+                    }
+                })?;
             BlockifierTransaction::from_api(
                 Transaction::Declare(DeclareTransaction::V3(declare_tx)),
                 tx_hash,
-                Some(class_v1),
+                Some(class_info),
                 None,
                 None,
                 only_query,
@@ -777,6 +873,7 @@ pub fn simulate_transactions(
     execution_config: &BlockExecutionConfig,
     charge_fee: bool,
     validate: bool,
+    override_kzg_da_to_false: bool,
 ) -> ExecutionResult<Vec<TransactionSimulationOutput>> {
     let trace_constructors = txs.iter().map(get_trace_constructor).collect::<Vec<_>>();
     let (execution_results, block_context) = execute_transactions(
@@ -790,27 +887,19 @@ pub fn simulate_transactions(
         execution_config,
         charge_fee,
         validate,
+        override_kzg_da_to_false,
     )?;
     execution_results
         .into_iter()
         .zip(trace_constructors)
         .map(|(tx_execution_output, trace_constructor)| {
-            let fee = tx_execution_output.execution_info.actual_fee;
-            let gas_price = match tx_execution_output.price_unit {
-                PriceUnit::Wei => {
-                    GasPrice(block_context.block_info().gas_prices.eth_l1_gas_price.get())
-                }
-                PriceUnit::Fri => {
-                    GasPrice(block_context.block_info().gas_prices.strk_l1_gas_price.get())
-                }
-            };
+            let fee_estimation =
+                tx_execution_output_to_fee_estimation(&tx_execution_output, &block_context)?;
             match trace_constructor(tx_execution_output.execution_info) {
                 Ok(transaction_trace) => Ok(TransactionSimulationOutput {
                     transaction_trace,
                     induced_state_diff: tx_execution_output.induced_state_diff,
-                    gas_price,
-                    fee,
-                    price_unit: tx_execution_output.price_unit,
+                    fee_estimation,
                 }),
                 Err(e) => Err(e),
             }
